@@ -62,8 +62,8 @@ class opts():
         self.parser.add_argument('-tds', '--t_downsample', type=int, default=1)
 
         self.parser.add_argument('--MAE_reload', type=int, default=0)
-        self.parser.add_argument('-r', '--resume', action='store_true')
-
+        self.parser.add_argument('-r', '--resume', default='', type=str, metavar='FILENAME',
+                                 help='checkpoint file name to resume training from')
 
 
 

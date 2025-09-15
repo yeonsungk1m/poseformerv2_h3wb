@@ -20,6 +20,77 @@ from model.stmo_pretrain import Model_MAE
 from thop import clever_format
 from thop.profile import profile
 import scipy.io as scio
+LATEST_CHECKPOINT = 'latest_epoch.pth'
+
+
+def _resolve_resume_path(opt):
+    """Return an absolute path to the checkpoint provided via --resume."""
+
+    if not opt.resume:
+        return ''
+
+    if os.path.isfile(opt.resume):
+        return opt.resume
+
+    return os.path.join(opt.checkpoint, opt.resume)
+
+
+def _collect_rng_states():
+    """Collect RNG states so that training can be resumed deterministically."""
+
+    rng_states = {
+        'python_random_state': random.getstate(),
+        'numpy_random_state': np.random.get_state(),
+        'torch_random_state': torch.get_rng_state(),
+    }
+
+    if torch.cuda.is_available():
+        rng_states['cuda_random_state'] = torch.cuda.get_rng_state_all()
+
+    return rng_states
+
+
+def _restore_rng_states(checkpoint):
+    """Restore RNG states stored in a checkpoint if available."""
+
+    python_state = checkpoint.get('python_random_state')
+    if python_state is not None:
+        random.setstate(python_state)
+
+    numpy_state = checkpoint.get('numpy_random_state')
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+
+    torch_state = checkpoint.get('torch_random_state')
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+
+    cuda_state = checkpoint.get('cuda_random_state')
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _save_training_checkpoint(opt, epoch, lr, optimizer, model):
+    """Persist the latest training state to disk for resuming later."""
+
+    checkpoint = {
+        'epoch': epoch,
+        'lr': lr,
+        'optimizer': optimizer.state_dict(),
+        'model_trans': model['trans'].state_dict(),
+        'model_refine': model['refine'].state_dict(),
+        'model_MAE': model['MAE'].state_dict(),
+        'previous_best_threshold': opt.previous_best_threshold,
+        'previous_name': opt.previous_name,
+        'previous_refine_name': opt.previous_refine_name,
+    }
+
+    checkpoint.update(_collect_rng_states())
+
+    latest_path = os.path.join(opt.checkpoint, LATEST_CHECKPOINT)
+    torch.save(checkpoint, latest_path)
+
+    return latest_path
 
 opt = opts().parse()
 os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu
@@ -330,8 +401,64 @@ if __name__ == '__main__':
     for i_model in model:
         all_param += list(model[i_model].parameters())
     optimizer_all = optim.Adam(all_param, lr=opt.lr, amsgrad=True)
+    start_epoch = 1
+    if opt.resume:
+        resume_path = _resolve_resume_path(opt)
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError('No checkpoint found at {}'.format(resume_path))
 
-    for epoch in range(1, opt.nepoch):
+        print('INFO: Loading checkpoint from {}'.format(resume_path))
+        checkpoint = torch.load(resume_path, map_location='cpu')
+        has_training_state = isinstance(checkpoint, dict) and (
+            'optimizer' in checkpoint or 'model_trans' in checkpoint or 'model_pos' in checkpoint)
+
+        if has_training_state:
+            if 'model_trans' in checkpoint:
+                model['trans'].load_state_dict(checkpoint['model_trans'], strict=True)
+            elif 'model_pos' in checkpoint:
+                model['trans'].load_state_dict(checkpoint['model_pos'], strict=True)
+
+            if 'model_refine' in checkpoint and checkpoint['model_refine'] is not None:
+                try:
+                    model['refine'].load_state_dict(checkpoint['model_refine'], strict=True)
+                except RuntimeError as err:
+                    print('WARNING: Failed to load refine model weights from checkpoint: {}'.format(err))
+
+            if 'model_MAE' in checkpoint and checkpoint['model_MAE'] is not None:
+                try:
+                    model['MAE'].load_state_dict(checkpoint['model_MAE'], strict=True)
+                except RuntimeError as err:
+                    print('WARNING: Failed to load MAE model weights from checkpoint: {}'.format(err))
+
+            if 'optimizer' in checkpoint:
+                optimizer_all.load_state_dict(checkpoint['optimizer'])
+            else:
+                print('WARNING: Checkpoint is missing optimizer state. Initializing optimizer from scratch.')
+
+            lr = checkpoint.get('lr', lr)
+            for param_group in optimizer_all.param_groups:
+                param_group['lr'] = lr
+
+            loaded_epoch = checkpoint.get('epoch', 0)
+            start_epoch = max(loaded_epoch + 1, 1)
+
+            opt.previous_best_threshold = checkpoint.get('previous_best_threshold', opt.previous_best_threshold)
+            opt.previous_name = checkpoint.get('previous_name', opt.previous_name)
+            opt.previous_refine_name = checkpoint.get('previous_refine_name', opt.previous_refine_name)
+
+            _restore_rng_states(checkpoint)
+
+            print('INFO: Resumed training from epoch {}'.format(start_epoch - 1))
+        else:
+            model['trans'].load_state_dict(checkpoint, strict=True)
+            print('WARNING: Checkpoint does not contain full training state. Optimizer will be reinitialized.')
+
+    epoch_iterator_start = start_epoch
+    if not opt.train and epoch_iterator_start >= opt.nepoch:
+        epoch_iterator_start = max(opt.nepoch - 1, 0)
+
+    for epoch in range(epoch_iterator_start, opt.nepoch):
+             
         if opt.train == 1:
             if not opt.MAE:
                 loss, mpjpe = train(opt, actions, train_dataloader, model, optimizer_all, epoch)
@@ -377,6 +504,8 @@ if __name__ == '__main__':
             for param_group in optimizer_all.param_groups:
                 param_group['lr'] *= opt.lr_decay
                 lr *= opt.lr_decay
+        if opt.train:
+            _save_training_checkpoint(opt, epoch, lr, optimizer_all, model)
 
 
 
