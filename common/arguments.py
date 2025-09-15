@@ -51,7 +51,14 @@ def parse_args():
     parser.add_argument('--depth', default=4, type=int, metavar='N', help='number of transformer blocks')  
     parser.add_argument('--embed-dim-ratio', default=32, type=int, metavar='N', help='dimension of embedding ratio') 
     parser.add_argument('-std', type=float, default=0.0, help='the standard deviation for gaussian noise')
-
+    parser.add_argument('--energy-weight', type=float, default=0.1, help='weight for energy-based loss term')
+    parser.add_argument('--lr-loss', type=float, default=0.0001, help='learning rate for loss network')
+    parser.add_argument('--em-loss-type', type=str, default='nce', choices=['nce', 'margin'],
+                        help='energy model loss type')
+    parser.add_argument('--em-margin-type', type=str, default='mse', choices=['mse', 'mpjpe', 'l1'],
+                        help='distance type for margin loss')
+    parser.add_argument('--em-margin-ratio', type=float, default=1.0, help='margin scaling ratio')
+    
     # Experimental
     parser.add_argument('--subset', default=1, type=float, metavar='FRACTION', help='reduce dataset size by fraction')
     parser.add_argument('--downsample', default=1, type=int, metavar='FACTOR', help='downsample frame rate by factor (semi-supervised)')

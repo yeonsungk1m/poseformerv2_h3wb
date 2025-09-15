@@ -1,2 +1,10 @@
 __pycache__/
 .DS_Store
+3dhp_test/
+dataset/*.npz
+*.pyc
+checkpoint/
+*.log
+*.logs
+*.npz
+*.bin

@@ -11,7 +11,6 @@ from common.arguments import parse_args
 import torch
 
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import os
 import sys
@@ -26,14 +25,12 @@ from common.camera import *
 import collections
 
 from common.model_poseformer import *
+from common.loss_net import ContinuousGraphLossNet, adj_from_parents, NCELoss, MarginBasedLoss
 
 from common.loss import *
 from common.generators import ChunkedGenerator, UnchunkedGenerator
 from time import time
 from common.utils import *
-from tqdm import tqdm
-
-
 args = parse_args()
 log =  logging.getLogger()
 
@@ -190,6 +187,10 @@ width = cam['res_w']
 height = cam['res_h']
 num_joints = keypoints_metadata['num_joints']
 
+# Build skeleton adjacency for loss network
+parents = dataset.skeleton().parents()
+adj = adj_from_parents(parents)
+
 #########################################PoseTransformer
 # if args.resume or args.from_scratch:
 model_pos_train = PoseTransformerV2(num_frame=receptive_field, num_joints=num_joints, in_chans=2,
@@ -197,6 +198,18 @@ model_pos_train = PoseTransformerV2(num_frame=receptive_field, num_joints=num_jo
 
 model_pos = PoseTransformerV2(num_frame=receptive_field, num_joints=num_joints, in_chans=2,
         num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None, drop_path_rate=0, args=args)
+
+loss_net = ContinuousGraphLossNet(adj=adj, num_joints=num_joints)
+if torch.cuda.is_available():
+    loss_net = loss_net.cuda()
+
+if args.em_loss_type == 'nce':
+    loss_fn = NCELoss()
+else:
+    loss_fn = MarginBasedLoss(margin_ratio=args.em_margin_ratio, loss_type=args.em_margin_type)
+w_mpjpe = torch.ones(num_joints, dtype=torch.float32)
+if torch.cuda.is_available():
+    w_mpjpe = w_mpjpe.cuda()
 
 #################
 causal_shift = 0
@@ -210,6 +223,8 @@ if torch.cuda.is_available():
     model_pos = model_pos.cuda()
     model_pos_train = nn.DataParallel(model_pos_train)
     model_pos_train = model_pos_train.cuda()
+    loss_net = nn.DataParallel(loss_net)
+    loss_net = loss_net.cuda()
 
 
 if args.resume or args.evaluate:
@@ -218,6 +233,8 @@ if args.resume or args.evaluate:
     checkpoint = torch.load(chk_filename, map_location=lambda storage, loc: storage)
     model_pos_train.load_state_dict(checkpoint['model_pos'], strict=False)
     model_pos.load_state_dict(checkpoint['model_pos'], strict=False)
+    if 'loss_net' in checkpoint:
+        loss_net.load_state_dict(checkpoint['loss_net'], strict=False)
 
 
 test_generator = UnchunkedGenerator(None, poses_valid, poses_valid_2d,
@@ -242,6 +259,7 @@ if not args.evaluate:
 
     lr = args.learning_rate
     optimizer = optim.AdamW(model_pos_train.parameters(), lr=lr, weight_decay=0.1)
+    optimizer_loss = optim.AdamW(loss_net.parameters(), lr=args.lr_loss, weight_decay=0.0)
 
     lr_decay = args.lr_decay
     losses_3d_train = []
@@ -260,6 +278,8 @@ if not args.evaluate:
         epoch = checkpoint['epoch']
         if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
             optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'optimizer_loss' in checkpoint and checkpoint['optimizer_loss'] is not None:
+                optimizer_loss.load_state_dict(checkpoint['optimizer_loss'])
             train_generator.set_random_state(checkpoint['random_state'])
         else:
             print('WARNING: this checkpoint does not contain an optimizer state. The optimizer will be reinitialized.')
@@ -276,39 +296,63 @@ if not args.evaluate:
         epoch_loss_2d_train_unlabeled = 0
         N = 0
         N_semi = 0
-        model_pos_train.train()
-
-        pbar = tqdm(train_generator.next_epoch(), total=train_generator.num_batches,
-                    desc=f'Epoch {epoch+1}/{args.epochs}', unit='batch')
-        for _, batch_3d, batch_2d in pbar:
-            inputs_3d = torch.from_numpy(batch_3d.astype('float32')) # [512, 1, 17, 3]
-            inputs_2d = torch.from_numpy(batch_2d.astype('float32')) # [512, 3, 17, 2]
+        for _, batch_3d, batch_2d in train_generator.next_epoch():
+            inputs_3d = torch.from_numpy(batch_3d.astype('float32'))
+            inputs_2d = torch.from_numpy(batch_2d.astype('float32'))
 
             if torch.cuda.is_available():
                 inputs_3d = inputs_3d.cuda()
                 inputs_2d = inputs_2d.cuda()
             inputs_3d[:, :, 0] = 0
 
+            B, T = inputs_3d.shape[:2]
+
+            # ----- LossNet update -----
+            model_pos_train.eval()
+            loss_net.train()
+            with torch.no_grad():
+                pred_detached = model_pos_train(inputs_2d)
+            # align 2D inputs with the frames predicted by the pose model
+            t_idx = getattr(model_pos_train, 't_idx', inputs_2d.shape[1] // 2)
+            inputs_2d_center = inputs_2d[:, t_idx:t_idx + pred_detached.shape[1]]
+            energy_hat = loss_net(inputs_2d_center, pred_detached).view(B, T)
+            energy_gt = loss_net(inputs_2d_center, inputs_3d.detach()).view(B, T)
+            loss_lossnet = loss_fn(pred_detached, inputs_3d.detach(), energy_hat, energy_gt)
+            optimizer_loss.zero_grad()
+            loss_lossnet.backward()
+            optimizer_loss.step()
+
+            # ----- TaskNet update -----
+            loss_net.eval()
+            model_pos_train.train()
             optimizer.zero_grad()
-
-            # Predict 3D poses
             predicted_3d_pos = model_pos_train(inputs_2d)
+            t_idx = getattr(model_pos_train, 't_idx', inputs_2d.shape[1] // 2)
+            inputs_2d_center = inputs_2d[:, t_idx:t_idx + predicted_3d_pos.shape[1]]
+            loss_mp = (torch.norm(predicted_3d_pos - inputs_3d, dim=-1) * w_mpjpe.view(1, 1, -1)).mean()
+            delta = predicted_3d_pos[:, 1:] - predicted_3d_pos[:, :-1]
+            smooth = (delta.pow(2).mean(dim=-1) * w_mpjpe).mean()
+            vel_gt = inputs_3d[:, 1:] - inputs_3d[:, :-1]
+            vel_err = torch.mean(torch.norm(delta - vel_gt, dim=-1) * w_mpjpe.view(1, 1, -1))
+            loss_temp = 0.5 * smooth + 2.0 * vel_err
+            for p in loss_net.parameters():
+                p.requires_grad = False
+            energy_pred = loss_net(inputs_2d_center, predicted_3d_pos).mean()
+            loss_task_total = loss_mp + loss_temp
+            loss_back = loss_task_total + args.energy_weight * energy_pred
+            loss_back.backward(loss_back.clone().detach())
+            optimizer.step()
+            for p in loss_net.parameters():
+                p.requires_grad = True
 
-            loss_3d_pos = mpjpe(predicted_3d_pos, inputs_3d)
-            epoch_loss_3d_train += inputs_3d.shape[0] * inputs_3d.shape[1] * loss_3d_pos.item()
-
+            epoch_loss_3d_train += inputs_3d.shape[0] * inputs_3d.shape[1] * loss_mp.item()
             N += inputs_3d.shape[0] * inputs_3d.shape[1]
 
-            loss_total = loss_3d_pos
-
-            loss_total.backward()
-
-            optimizer.step()
-            del inputs_2d, inputs_3d, loss_3d_pos, predicted_3d_pos
+            del (inputs_2d, inputs_3d, pred_detached, energy_hat, energy_gt,
+                 loss_lossnet, predicted_3d_pos, loss_mp, delta, smooth, vel_gt, vel_err,
+                 loss_temp, energy_pred, loss_task_total, loss_back)
             torch.cuda.empty_cache()
-            pbar.set_postfix({'loss': loss_total.item() * 1000})
-        pbar.close()
-        
+
         losses_3d_train.append(epoch_loss_3d_train / N)
         torch.cuda.empty_cache()
 
@@ -381,6 +425,8 @@ if not args.evaluate:
         lr *= lr_decay
         for param_group in optimizer.param_groups:
             param_group['lr'] *= lr_decay
+        for param_group in optimizer_loss.param_groups:
+            param_group['lr'] *= lr_decay
         epoch += 1
 
         if not os.path.exists(args.checkpoint):
@@ -396,7 +442,9 @@ if not args.evaluate:
                 'lr': lr,
                 'random_state': train_generator.random_state(),
                 'optimizer': optimizer.state_dict(),
+                'optimizer_loss': optimizer_loss.state_dict(),
                 'model_pos': model_pos_train.state_dict(),
+                'loss_net': loss_net.state_dict(),
             }, chk_path)
 
         #### save best checkpoint
@@ -409,7 +457,9 @@ if not args.evaluate:
                 'lr': lr,
                 'random_state': train_generator.random_state(),
                 'optimizer': optimizer.state_dict(),
+                'optimizer_loss': optimizer_loss.state_dict(),
                 'model_pos': model_pos_train.state_dict(),
+                'loss_net': loss_net.state_dict(),
             }, best_chk_path)
 
         # Save training curves after every epoch, as .png images (if requested)
@@ -689,4 +739,3 @@ else:
             print('Evaluating on subject', subject)
             run_evaluation(all_actions_by_subject[subject], action_filter)
             print('')
-     

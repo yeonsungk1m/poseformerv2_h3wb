@@ -231,6 +231,7 @@ class PoseTransformerV2(nn.Module):
 
     def forward(self, x):
         b, f, p, _ = x.shape
+        self.t_idx = f // 2
         x_ = x.clone()
 
         Spatial_feature = self.Spatial_forward_features(x)
