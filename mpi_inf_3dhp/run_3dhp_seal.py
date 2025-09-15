@@ -1,7 +1,6 @@
 import argparse
 import os
 import random
-import logging
 
 import numpy as np
 import torch
@@ -16,11 +15,96 @@ from common.loss_net import (
     MarginBasedLoss,
 )
 
-from mpi_inf_3dhp.common.load_data_3dhp_mae import Fusion
-from mpi_inf_3dhp.common.utils import mpjpe_cal, AccumLoss, get_varialbe
-from mpi_inf_3dhp.model.model_poseformerv2 import Model
-from mpi_inf_3dhp.common.opt import opts
+from common.load_data_3dhp_mae import Fusion
+from common.utils import mpjpe_cal, AccumLoss, get_varialbe
+from model.model_poseformerv2 import Model
+from common.opt import opts
 
+LATEST_CHECKPOINT = "latest_epoch.pth"
+BEST_CHECKPOINT = "best_epoch.pth"
+
+
+def _resolve_resume_path(opt):
+    """Return an absolute path to the checkpoint provided via --resume."""
+
+    if not getattr(opt, "resume", ""):
+        return ""
+
+    if os.path.isfile(opt.resume):
+        return opt.resume
+
+    return os.path.join(opt.checkpoint, opt.resume)
+
+
+def _collect_rng_states():
+    """Collect RNG states so that training can be resumed deterministically."""
+
+    rng_states = {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_random_state": torch.get_rng_state(),
+    }
+
+    if torch.cuda.is_available():
+        rng_states["cuda_random_state"] = torch.cuda.get_rng_state_all()
+
+    return rng_states
+
+
+def _restore_rng_states(checkpoint):
+    """Restore RNG states stored in a checkpoint if available."""
+
+    python_state = checkpoint.get("python_random_state")
+    if python_state is not None:
+        random.setstate(python_state)
+
+    numpy_state = checkpoint.get("numpy_random_state")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+
+    torch_state = checkpoint.get("torch_random_state")
+    if torch_state is not None:
+        torch.set_rng_state(torch_state)
+
+    cuda_state = checkpoint.get("cuda_random_state")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _save_checkpoint(
+    opt,
+    epoch,
+    model,
+    loss_net,
+    optimizer,
+    optimizer_loss,
+    best_metric=None,
+    is_best=False,
+):
+    """Persist the current training state to disk."""
+
+    checkpoint = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "loss_net": loss_net.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "optimizer_loss": optimizer_loss.state_dict(),
+        "lr": optimizer.param_groups[0]["lr"] if optimizer.param_groups else None,
+        "lr_loss": optimizer_loss.param_groups[0]["lr"]
+        if optimizer_loss.param_groups
+        else None,
+        "best_metric": best_metric,
+    }
+
+    checkpoint.update(_collect_rng_states())
+
+    os.makedirs(opt.checkpoint, exist_ok=True)
+    latest_path = os.path.join(opt.checkpoint, LATEST_CHECKPOINT)
+    torch.save(checkpoint, latest_path)
+
+    if is_best:
+        best_path = os.path.join(opt.checkpoint, BEST_CHECKPOINT)
+    return latest_path
 
 def create_dataloaders(opt):
     """Create train and test dataloaders for MPI-INF-3DHP."""
@@ -200,11 +284,113 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=opt.lr)
     optimizer_loss = optim.AdamW(loss_net.parameters(), lr=opt.lr_loss)
 
-    for epoch in range(1, opt.nepoch + 1):
+    start_epoch = 1
+    best_metric = None
+
+    resume_path = _resolve_resume_path(opt)
+    if resume_path:
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"No checkpoint found at {resume_path}")
+
+        print(f"INFO: Loading checkpoint from {resume_path}")
+        checkpoint = torch.load(resume_path, map_location="cpu")
+
+        if isinstance(checkpoint, dict):
+            model_state = checkpoint.get("model")
+            if model_state is None:
+                model_state = checkpoint
+            model.load_state_dict(model_state, strict=False)
+
+            loss_state = checkpoint.get("loss_net")
+            if loss_state is not None:
+                try:
+                    loss_net.load_state_dict(loss_state, strict=False)
+                except RuntimeError as err:
+                    print(
+                        "WARNING: Failed to load SEAL loss network weights from checkpoint:"
+                        f" {err}"
+                    )
+            else:
+                print("WARNING: Checkpoint is missing SEAL loss network weights.")
+
+            optimizer_state = checkpoint.get("optimizer")
+            if optimizer_state is not None:
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                except ValueError as err:
+                    print(
+                        "WARNING: Failed to load optimizer state from checkpoint:"
+                        f" {err}"
+                    )
+            else:
+                print("WARNING: Checkpoint does not contain optimizer state. Initializing optimizer from scratch.")
+
+            optimizer_loss_state = checkpoint.get("optimizer_loss")
+            if optimizer_loss_state is not None:
+                try:
+                    optimizer_loss.load_state_dict(optimizer_loss_state)
+                except ValueError as err:
+                    print(
+                        "WARNING: Failed to load loss optimizer state from checkpoint:"
+                        f" {err}"
+                    )
+            else:
+                print(
+                    "WARNING: Checkpoint does not contain loss optimizer state. "
+                    "Initializing loss optimizer from scratch."
+                )
+
+            resume_lr = checkpoint.get("lr")
+            if resume_lr is not None:
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = resume_lr
+
+            resume_lr_loss = checkpoint.get("lr_loss")
+            if resume_lr_loss is not None:
+                for param_group in optimizer_loss.param_groups:
+                    param_group["lr"] = resume_lr_loss
+
+            start_epoch = max(checkpoint.get("epoch", 0) + 1, 1)
+            best_metric = checkpoint.get(
+                "best_metric", checkpoint.get("best_test", best_metric)
+            )
+
+            if best_metric is not None:
+                print(f"INFO: Best recorded test MPJPE: {best_metric:.4f}")
+
+            _restore_rng_states(checkpoint)
+
+            print(f"INFO: Resumed training from epoch {start_epoch - 1}")
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+            print(
+                "WARNING: Loaded checkpoint without optimizer information. "
+                "Optimizers will be reinitialized."
+            )
+
+    for epoch in range(start_epoch, opt.nepoch + 1):
         loss_train = train_epoch(
             opt, train_loader, model, loss_net, optimizer, optimizer_loss, loss_fn
         )
         print(f"Epoch {epoch}: train MPJPE {loss_train:.4f}")
+        is_best = False
         if opt.test:
             loss_test = evaluate(opt, test_loader, model)
             print(f"Epoch {epoch}: test MPJPE {loss_test:.4f}")
+            
+            if best_metric is None or loss_test < best_metric:
+                best_metric = loss_test
+                is_best = True
+                print(f"New best test MPJPE: {best_metric:.4f}")
+
+        ckpt_path = _save_checkpoint(
+            opt,
+            epoch,
+            model,
+            loss_net,
+            optimizer,
+            optimizer_loss,
+            best_metric,
+            is_best=is_best,
+        )
+        print(f"Saved checkpoint to {ckpt_path}")

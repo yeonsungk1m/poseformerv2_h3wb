@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=PoseformerV2
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --time=0-12:00:00
 #SBATCH --mem=16GB
 #SBATCH --cpus-per-task=12
@@ -14,10 +14,13 @@
 #   > out_3dhp.log 2> error_3dhp.log
 
 
-python -u run_3dhp.py --gpu 0,1,2,3 \
+python -u run_3dhp_seal.py --gpu 0 \
     -f 27 -frame-kept 3 -coeff-kept 3 \
     --train 1 --lr 0.0007 -lrd 0.97 \
-    -c checkpoint_3dhp \
-    > out_3dhp.log 2> error_3dhp.log
+    --lr-loss 0.0001 --energy-weight 1e-5 \
+    --em-loss-type margin --em-margin-type mpjpe \
+    -c checkpoint_3dhp_seal \
+    > out_3dhp_seal.log 2> error_3dhp_seal.log
+
 
 # python run_3dhp.py -f 81 -frame-kept 9 -coeff-kept 9 -b 512 --train 1 --lr 0.0007 -lrd 0.97 -c CKPT_NAME --gpu 0
