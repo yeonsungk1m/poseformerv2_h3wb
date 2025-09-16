@@ -70,6 +70,41 @@ def _restore_rng_states(checkpoint):
     if cuda_state is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_state)
 
+def _get_module(model):
+    """Return the underlying module, handling DataParallel wrappers."""
+
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _infer_center_index(model, seq_len):
+    """Infer the center frame index for a ground-truth sequence."""
+
+    module = _get_module(model) if model is not None else None
+    if module is not None:
+        for attr in ("t_out_idx", "t_idx"):
+            center_idx = getattr(module, attr, None)
+            if center_idx is None:
+                continue
+            center_idx = int(center_idx)
+            if 0 <= center_idx < seq_len:
+                return center_idx
+
+    return seq_len // 2
+
+
+def _slice_target_sequence(target_seq, length, model=None):
+    """Slice the target sequence around its center to match the prediction length."""
+
+    assert length > 0, "Prediction length must be positive"
+    total_len = target_seq.shape[1]
+    if length >= total_len:
+        return target_seq.contiguous()
+
+    center_idx = _infer_center_index(model, total_len)
+    start = center_idx - length // 2
+    start = max(0, min(start, total_len - length))
+    end = start + length
+    return target_seq[:, start:end].contiguous()
 
 def _save_checkpoint(
     opt,
@@ -104,6 +139,7 @@ def _save_checkpoint(
 
     if is_best:
         best_path = os.path.join(opt.checkpoint, BEST_CHECKPOINT)
+        torch.save(checkpoint, best_path)
     return latest_path
 
 def create_dataloaders(opt):
@@ -145,7 +181,7 @@ def train_epoch(opt, train_loader, model, loss_net, optimizer, optimizer_loss, l
             .contiguous()
         )
         inputs_3d = gt_3D.view(N, -1, opt.out_joints, opt.out_channels)
-        B, T = inputs_3d.shape[:2]
+        B = inputs_3d.shape[0]
 
         # -------- Loss network update --------
         model.eval()
@@ -157,14 +193,18 @@ def train_epoch(opt, train_loader, model, loss_net, optimizer, optimizer_loss, l
             .view(N, -1, opt.out_joints, opt.out_channels)
         )
         pred_detached = pred_detached * scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        t_idx = getattr(model.module, "t_idx", inputs_2d.shape[2] // 2)
+        module = _get_module(model)
+        t_idx = getattr(module, "t_idx", inputs_2d.shape[2] // 2)
         inputs_2d_center = inputs_2d[
             :, :, t_idx : t_idx + pred_detached.shape[1], :, 0
         ].permute(0, 2, 3, 1)
-        energy_hat = loss_net(inputs_2d_center, pred_detached).view(B, T)
-        energy_gt = loss_net(inputs_2d_center, inputs_3d.detach()).view(B, T)
+        target_detached = _slice_target_sequence(inputs_3d, pred_detached.shape[1], model)
+        energy_hat = loss_net(inputs_2d_center, pred_detached).view(B, pred_detached.shape[1])
+        energy_gt = loss_net(inputs_2d_center, target_detached.detach()).view(
+            B, pred_detached.shape[1]
+        )
         loss_lossnet = loss_fn(
-            pred_detached.detach(), inputs_3d.detach(), energy_hat, energy_gt
+            pred_detached.detach(), target_detached.detach(), energy_hat, energy_gt
         )
         optimizer_loss.zero_grad()
         loss_lossnet.backward()
@@ -185,7 +225,8 @@ def train_epoch(opt, train_loader, model, loss_net, optimizer, optimizer_loss, l
         inputs_2d_center = inputs_2d[
             :, :, t_idx : t_idx + pred_3d.shape[1], :, 0
         ].permute(0, 2, 3, 1)
-        loss_pose = mpjpe_cal(pred_3d, inputs_3d)
+        target_pose = _slice_target_sequence(inputs_3d, pred_3d.shape[1], model)
+        loss_pose = mpjpe_cal(pred_3d, target_pose)
         energy_pred = loss_net(inputs_2d_center, pred_3d).mean()
         loss_total = loss_pose + opt.energy_weight * energy_pred
         optimizer.zero_grad()
@@ -194,7 +235,8 @@ def train_epoch(opt, train_loader, model, loss_net, optimizer, optimizer_loss, l
         for p in loss_net.parameters():
             p.requires_grad = True
 
-        losses.update(loss_pose.item() * B * T, B * T)
+        B_pose, T_pose = pred_3d.shape[:2]
+        losses.update(loss_pose.item() * B_pose * T_pose, B_pose * T_pose)
 
         del (
             gt_3D,
@@ -236,9 +278,10 @@ def evaluate(opt, test_loader, model):
                 .view(N, -1, opt.out_joints, opt.out_channels)
             )
             pred_3d = pred_3d * scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            loss = mpjpe_cal(pred_3d, inputs_3d)
-            B, T = inputs_3d.shape[:2]
-            losses.update(loss.item() * B * T, B * T)
+            target_pose = _slice_target_sequence(inputs_3d, pred_3d.shape[1], model)
+            loss = mpjpe_cal(pred_3d, target_pose)
+            B_eval, T_eval = pred_3d.shape[:2]
+            losses.update(loss.item() * B_eval * T_eval, B_eval * T_eval)
     return losses.avg
 
 

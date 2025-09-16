@@ -64,6 +64,35 @@ class opts():
         self.parser.add_argument('--MAE_reload', type=int, default=0)
         self.parser.add_argument('-r', '--resume', default='', type=str, metavar='FILENAME',
                                  help='checkpoint file name to resume training from')
+        self.parser.add_argument(
+            '--lr-loss', type=float, default=1e-4, help='learning rate for loss network'
+        )
+        self.parser.add_argument(
+            '--energy-weight',
+            type=float,
+            default=0.1,
+            help='weight applied to the learned energy term',
+        )
+        self.parser.add_argument(
+            '--em-loss-type',
+            type=str,
+            default='nce',
+            choices=['nce', 'margin'],
+            help='loss type used for the energy model',
+        )
+        self.parser.add_argument(
+            '--em-margin-type',
+            type=str,
+            default='mse',
+            choices=['mse', 'mpjpe', 'l1'],
+            help='distance metric for the margin-based loss',
+        )
+        self.parser.add_argument(
+            '--em-margin-ratio',
+            type=float,
+            default=1.0,
+            help='margin scaling factor for the energy loss',
+        )
 
 
 
