@@ -14,10 +14,18 @@
 #   > out_3dhp.log 2> error_3dhp.log
 
 
+# python -u run_3dhp.py --gpu 0 \
+#     -f 27 -frame-kept 3 -coeff-kept 3 \
+#     --train 1 --lr 0.0007 -lrd 0.97 \
+#     -c checkpoint_3dhp \
+#     > out_3dhp.log 2> error_3dhp.log
+
+#원래 학습하던거
+
 python -u run_3dhp.py --gpu 0 \
     -f 27 -frame-kept 3 -coeff-kept 3 \
     --train 1 --lr 0.0007 -lrd 0.97 \
     -c checkpoint_3dhp \
-    > out_3dhp.log 2> error_3dhp.log
-
-# python run_3dhp.py -f 81 -frame-kept 9 -coeff-kept 9 -b 512 --train 1 --lr 0.0007 -lrd 0.97 -c CKPT_NAME --gpu 0
+    --resume latest_epoch.pth \
+    >> out_3dhp.log 2>> error_3dhp.log
+#이어서 학습하는것
