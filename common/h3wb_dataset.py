@@ -7,6 +7,7 @@
 import copy
 import glob
 import os
+import re
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -721,9 +722,15 @@ class Human3WBDataset(MocapDataset):
 
     def _resolve_joint(self, value: JointSpec) -> int:
         if isinstance(value, str):
-            if value not in self._joint_name_to_index:
-                raise KeyError(f'Unknown joint name: {value}')
-            return self._joint_name_to_index[value]
+            text = value.strip()
+            if not text:
+                raise KeyError('Empty joint reference')
+            if text in self._joint_name_to_index:
+                return self._joint_name_to_index[text]
+            try:
+                return int(text)
+            except ValueError as exc:
+                raise KeyError(f'Unknown joint name: {value}') from exc
         return int(value)
 
     def _resolve_indices(self, values: Iterable[JointSpec], skeleton_meta: Mapping) -> List[int]:
@@ -734,12 +741,136 @@ class Human3WBDataset(MocapDataset):
         resolved = []
         for value in values:
             if isinstance(value, str):
-                if value not in name_to_index:
-                    raise KeyError(f'Unknown joint name: {value}')
-                resolved.append(name_to_index[value])
+                text = value.strip()
+                if text in name_to_index:
+                    resolved.append(name_to_index[text])
+                    continue
+                try:
+                    resolved.append(int(text))
+                except ValueError as exc:
+                    raise KeyError(f'Unknown joint name: {value}') from exc
             else:
                 resolved.append(int(value))
         return resolved
+    def _iter_joint_specs(self, spec) -> Iterable:
+        if spec is None:
+            return []
+        if isinstance(spec, np.ndarray):
+            if spec.ndim == 0:
+                return self._iter_joint_specs(spec.item())
+            return [item for element in spec.tolist() for item in self._iter_joint_specs(element)]
+        if isinstance(spec, Mapping):
+            return [item for value in spec.values() for item in self._iter_joint_specs(value)]
+        if isinstance(spec, (list, tuple, set)):
+            return [item for element in spec for item in self._iter_joint_specs(element)]
+        if isinstance(spec, (bytes, bytearray)):
+            try:
+                return [spec.decode()]
+            except Exception:
+                return [spec]
+        return [spec]
+
+    def _resolve_joint_list(self, spec) -> List[int]:
+        resolved: List[int] = []
+        for candidate in self._iter_joint_specs(spec):
+            if candidate is None:
+                continue
+            try:
+                idx = self._resolve_joint(candidate)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if idx not in resolved:
+                resolved.append(idx)
+        return resolved
+
+    def _find_hip_hint(self, metadata: Optional[Mapping]):
+        if not isinstance(metadata, Mapping):
+            return None
+        preferred_keys = (
+            'hip',
+            'hips',
+            'hip_center',
+            'hip_indices',
+            'hip_joints',
+            'pelvis',
+            'pelvis_center',
+        )
+        for key in preferred_keys:
+            if key in metadata and metadata[key] is not None:
+                return metadata[key]
+        for key, value in metadata.items():
+            if isinstance(key, str) and 'hip' in key.lower() and value is not None:
+                return value
+        return None
+
+    def _infer_hip_from_structure(self) -> List[int]:
+        skeleton = self.skeleton()
+        if not skeleton:
+            return []
+        left = list(skeleton.joints_left())
+        right = list(skeleton.joints_right())
+        if not left or not right:
+            return []
+        parents_array = skeleton.parents()
+        parents: List[int] = parents_array.tolist() if hasattr(parents_array, 'tolist') else list(parents_array)
+
+        def depth(index: int) -> int:
+            visited = set()
+            current = index
+            level = 0
+            while current != -1 and current not in visited and current < len(parents):
+                visited.add(current)
+                parent = parents[current]
+                if parent == current:
+                    break
+                current = parent
+                level += 1
+            return level
+
+        best_pair: Optional[Tuple[int, int]] = None
+        best_depth = float('inf')
+        for l_idx, r_idx in zip(left, right):
+            candidate_depth = min(depth(l_idx), depth(r_idx))
+            if best_pair is None or candidate_depth < best_depth:
+                best_pair = (l_idx, r_idx)
+                best_depth = candidate_depth
+        return list(best_pair) if best_pair is not None else []
+
+    def _infer_hip_from_names(self) -> List[int]:
+        skeleton = self.skeleton()
+        if not skeleton or not self._joint_names:
+            return []
+        normalized_names = {
+            idx: re.sub(r'[^a-z0-9]+', '', str(name).lower())
+            for idx, name in enumerate(self._joint_names)
+        }
+        left = list(skeleton.joints_left())
+        right = list(skeleton.joints_right())
+        hip_tokens = ('hip', 'pelv')
+        for l_idx, r_idx in zip(left, right):
+            left_name = normalized_names.get(l_idx, '')
+            right_name = normalized_names.get(r_idx, '')
+            combined = left_name + right_name
+            if any(token in combined for token in hip_tokens):
+                return [l_idx, r_idx]
+        hip_candidates = [
+            idx
+            for idx, name in normalized_names.items()
+            if any(token in name for token in hip_tokens)
+        ]
+        if hip_candidates:
+            left_set = set(left)
+            right_set = set(right)
+            left_choice = next((idx for idx in hip_candidates if idx in left_set), None)
+            right_choice = next(
+                (idx for idx in hip_candidates if idx in right_set and idx != left_choice),
+                None,
+            )
+            if left_choice is not None and right_choice is not None:
+                return [left_choice, right_choice]
+            if len(hip_candidates) >= 2:
+                return hip_candidates[:2]
+        return []
 
     def _build_joint_groups(self, metadata: Mapping) -> Dict[str, List[int]]:
         groups = metadata.get('joint_groups', {})
@@ -750,14 +881,43 @@ class Human3WBDataset(MocapDataset):
 
     def _build_centering_map(self, metadata: Mapping) -> Dict[str, List[int]]:
         centering = metadata.get('centering', {})
+        if isinstance(centering, np.ndarray):
+            if centering.size == 1 and centering.dtype == object:
+                centering = centering.item()
+            else:
+                centering = {}
+        if not isinstance(centering, Mapping):
+            centering = {}
         resolved = {}
         for mode, indices in centering.items():
-            if isinstance(indices, (list, tuple)):
-                resolved[mode] = [self._resolve_joint(idx) for idx in indices]
-            else:
-                resolved[mode] = [self._resolve_joint(indices)]
-        if 'root' not in resolved:
+            resolved[mode] = self._resolve_joint_list(indices)
+
+        if 'root' not in resolved or not resolved['root']:
             resolved['root'] = [0]
+        if 'hip' not in resolved or not resolved['hip']:
+            hip_hint = self._find_hip_hint(metadata)
+            if hip_hint is None:
+                skeleton_meta = metadata.get('skeleton')
+                if not isinstance(skeleton_meta, Mapping):
+                    skeleton_meta = None
+                hip_hint = self._find_hip_hint(skeleton_meta)
+            hip_indices = self._resolve_joint_list(hip_hint) if hip_hint is not None else []
+            if hip_indices:
+                resolved['hip'] = hip_indices
+
+        if 'hip' not in resolved or not resolved['hip']:
+            inferred_from_names = self._infer_hip_from_names()
+            if inferred_from_names:
+                resolved['hip'] = inferred_from_names
+
+        if 'hip' not in resolved or not resolved['hip']:
+            inferred_from_structure = self._infer_hip_from_structure()
+            if inferred_from_structure:
+                resolved['hip'] = inferred_from_structure
+
+        if 'hip' not in resolved or not resolved['hip']:
+            num_joints = self.skeleton().num_joints() if self.skeleton() else None
+            resolved['hip'] = [11, 12] if num_joints is None or num_joints > 12 else [0]
         return resolved
     def _normalize_subject_list(self, value: Optional[Union[List[str], Tuple[str, ...], set, str]]) -> Optional[List[str]]:
         if not value:
@@ -771,6 +931,8 @@ class Human3WBDataset(MocapDataset):
     def _prepare_keypoints_metadata(self, metadata: Mapping, skeleton: Skeleton) -> Dict:
         raw = metadata.get('keypoints_metadata') or metadata.get('keypoints') or {}
         info = copy.deepcopy(raw)
+        if 'layout_name' not in info:
+            info['layout_name'] = metadata.get('layout_name', 'h3wb')
         if 'num_joints' not in info:
             if self._joint_names:
                 info['num_joints'] = len(self._joint_names)
