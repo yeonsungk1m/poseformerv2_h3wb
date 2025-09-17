@@ -119,12 +119,50 @@ if args.dataset != 'h3wb':
         
 
 print('Loading 2D detections...')
-keypoints = np.load('data/data_2d_' + args.dataset + '_' + args.keypoints + '.npz', allow_pickle=True)
-keypoints_metadata = keypoints['metadata'].item()
-keypoints_symmetry = keypoints_metadata['keypoints_symmetry']
+keypoints_path = f"data/data_2d_{args.dataset}_{args.keypoints}.npz"
+keypoints_metadata = None
+keypoints_are_normalized = False
+
+if os.path.exists(keypoints_path):
+    with np.load(keypoints_path, allow_pickle=True) as keypoints_file:
+        keypoints_metadata = keypoints_file['metadata'].item()
+        keypoints = keypoints_file['positions_2d'].item()
+else:
+    if args.dataset == 'h3wb' and hasattr(dataset, 'keypoints'):
+        keypoints = dataset.keypoints()
+        if not keypoints:
+            raise FileNotFoundError(
+                f'No 2D detections found in {keypoints_path} and dataset does not provide keypoints.'
+            )
+        print('Using 2D detections bundled with the H3WB dataset archive.')
+        metadata_from_dataset = dataset.keypoints_metadata() if hasattr(dataset, 'keypoints_metadata') else {}
+        keypoints_metadata = dict(metadata_from_dataset) if metadata_from_dataset else {}
+        if hasattr(dataset, 'keypoints_are_normalized'):
+            keypoints_are_normalized = bool(dataset.keypoints_are_normalized())
+    else:
+        raise FileNotFoundError(
+            f'2D detections file {keypoints_path} was not found and the dataset does not provide keypoints.'
+        )
+
+if keypoints_metadata is None:
+    keypoints_metadata = {}
+
+keypoints_are_normalized = keypoints_are_normalized or bool(
+    keypoints_metadata.get('normalized') or keypoints_metadata.get('is_normalized')
+)
+
+keypoints_symmetry = keypoints_metadata.get('keypoints_symmetry')
+if not keypoints_symmetry:
+    keypoints_symmetry = (
+        list(dataset.skeleton().joints_left()),
+        list(dataset.skeleton().joints_right()),
+    )
+    keypoints_metadata['keypoints_symmetry'] = keypoints_symmetry
 kps_left, kps_right = list(keypoints_symmetry[0]), list(keypoints_symmetry[1])
 joints_left, joints_right = list(dataset.skeleton().joints_left()), list(dataset.skeleton().joints_right())
-keypoints = keypoints['positions_2d'].item()
+
+if 'num_joints' not in keypoints_metadata:
+    keypoints_metadata['num_joints'] = dataset.skeleton().num_joints()
 
 ###################
 for subject in dataset.subjects():
@@ -151,9 +189,13 @@ for subject in keypoints.keys():
         for cam_idx, kps in enumerate(keypoints[subject][action]):
             # Normalize camera frame
             cam = dataset.cameras()[subject][cam_idx]
+            kps = np.asarray(kps, dtype='float32')
             if args.std != 0:
-                kps += np.random.normal(loc=0.0, scale=args.std, size=kps.shape)
-            kps[..., :2] = normalize_screen_coordinates(kps[..., :2], w=cam['res_w'], h=cam['res_h'])
+                noise = np.random.normal(loc=0.0, scale=args.std, size=kps.shape).astype('float32')
+                kps = kps + noise
+            if not keypoints_are_normalized:
+                kps[..., :2] = normalize_screen_coordinates(kps[..., :2], w=cam['res_w'], h=cam['res_h'])
+            kps = kps.astype('float32', copy=False)
             keypoints[subject][action][cam_idx] = kps
 
 if args.dataset == 'h36m':
