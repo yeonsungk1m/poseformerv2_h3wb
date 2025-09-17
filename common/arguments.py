@@ -33,7 +33,8 @@ def parse_args():
     parser.add_argument('-g', '--gpu', type=list, help='set gpu number')
     parser.add_argument('--local_rank', type=int, default=0, help='node rank for distributed training')
     parser.add_argument('--center-pose', type=int, default=0, help='choose fine-tuning task as 3d pose estimation')
-
+    parser.add_argument('--centering', type=str, default='auto', choices=['auto', 'root', 'hip', 'joint14'],
+                        help='reference joint strategy for pose centering')
     # Model arguments
     parser.add_argument('-s', '--stride', default=1, type=int, metavar='N', help='chunk size to use during training')
     parser.add_argument('-e', '--epochs', default=200, type=int, metavar='N', help='number of training epochs')

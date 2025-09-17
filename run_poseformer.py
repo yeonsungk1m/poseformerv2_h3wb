@@ -21,7 +21,7 @@ import logging
 
 from einops import rearrange, repeat
 from copy import deepcopy
-
+from typing import List, Optional
 from common.camera import *
 import collections
 
@@ -36,7 +36,38 @@ from tqdm import tqdm
 
 args = parse_args()
 log =  logging.getLogger()
+def parse_subjects_arg(value: str) -> List[str]:
+    if not value:
+        return []
+    return [item for item in value.split(',') if item]
 
+
+def resolve_center_indices(dataset, centering_mode: str) -> Optional[List[int]]:
+    if hasattr(dataset, 'resolve_center'):
+        indices = dataset.resolve_center(centering_mode)
+        if indices is not None:
+            return indices
+    if centering_mode == 'root':
+        return [0]
+    if centering_mode == 'joint14':
+        return [14]
+    return None
+
+
+def center_torch(poses, center_indices: Optional[List[int]], mode: str):
+    if center_indices is None:
+        return poses, None
+    if mode in ('root', 'joint14'):
+        for idx in center_indices:
+            poses[:, :, idx, :] = 0
+        return poses, None
+    if len(center_indices) == 1:
+        center = poses[:, :, center_indices[0], :].unsqueeze(2)
+    else:
+        stacked = torch.stack([poses[:, :, idx, :] for idx in center_indices], dim=2)
+        center = stacked.mean(dim=2, keepdim=True)
+    poses = poses - center
+    return poses, center
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = ''.join(args.gpu)
@@ -54,24 +85,38 @@ dataset_path = 'data/data_3d_' + args.dataset + '.npz'
 if args.dataset == 'h36m':
     from common.h36m_dataset import Human36mDataset
     dataset = Human36mDataset(dataset_path)
+elif args.dataset == 'h3wb':
+    from common.h3wb_dataset import Human3WBDataset
+    dataset = Human3WBDataset(dataset_path)
 elif args.dataset.startswith('custom'):
     from common.custom_dataset import CustomDataset
     dataset = CustomDataset('data/data_2d_' + args.dataset + '_' + args.keypoints + '.npz')
 else:
     raise KeyError('Invalid dataset')
 
-print('Preparing data...')
-for subject in dataset.subjects():
-    for action in dataset[subject].keys():
-        anim = dataset[subject][action]
+centering_mode = args.centering
+if centering_mode == 'auto':
+    if args.dataset == 'h3wb' and hasattr(dataset, 'default_centering'):
+        centering_mode = dataset.default_centering()
+    else:
+        centering_mode = 'root'
+center_indices = resolve_center_indices(dataset, centering_mode)
+if centering_mode == 'hip' and center_indices is None:
+    raise ValueError('Hip centering requested but dataset does not provide hip indices.')
 
-        if 'positions' in anim:
-            positions_3d = []
-            for cam in anim['cameras']:
-                pos_3d = world_to_camera(anim['positions'], R=cam['orientation'], t=cam['translation'])
-                pos_3d[:, 1:] -= pos_3d[:, :1] # Remove global offset, but keep trajectory in first position
-                positions_3d.append(pos_3d)
-            anim['positions_3d'] = positions_3d
+print('Preparing data...')
+if args.dataset != 'h3wb':
+    for subject in dataset.subjects():
+        for action in dataset[subject].keys():
+            anim = dataset[subject][action]
+            if 'positions' in anim:
+                positions_3d = []
+                for cam in anim['cameras']:
+                    pos_3d = world_to_camera(anim['positions'], R=cam['orientation'], t=cam['translation'])
+                    pos_3d[:, 1:] -= pos_3d[:, :1] # Remove global offset, but keep trajectory in first position
+                    positions_3d.append(pos_3d)
+                anim['positions_3d'] = positions_3d
+        
 
 print('Loading 2D detections...')
 keypoints = np.load('data/data_2d_' + args.dataset + '_' + args.keypoints + '.npz', allow_pickle=True)
@@ -114,9 +159,27 @@ for subject in keypoints.keys():
 if args.dataset == 'h36m':
     subjects_train = 'S1,S5,S6,S7,S8'.split(',')
     subjects_test = 'S9,S11'.split(',')
+elif args.dataset == 'h3wb':
+    default_train = 'S1,S5,S6,S7,S8'
+    default_test = 'S9,S11'
+    all_subjects = list(dataset.subjects()) if hasattr(dataset, 'subjects') else []
+    meta_train = dataset.subjects_train() if hasattr(dataset, 'subjects_train') else None
+    meta_test = dataset.subjects_test() if hasattr(dataset, 'subjects_test') else None
+    if meta_train:
+        subjects_train = meta_train
+    elif args.subjects_train == default_train:
+        subjects_train = all_subjects
+    else:
+        subjects_train = parse_subjects_arg(args.subjects_train)
+    if meta_test:
+        subjects_test = meta_test
+    elif args.subjects_test == default_test:
+        subjects_test = [s for s in all_subjects if s not in subjects_train]
+    else:
+        subjects_test = parse_subjects_arg(args.subjects_test)
 else:
-    subjects_train = args.subjects_train.split(',')
-    subjects_test = args.subjects_test.split(',')
+    subjects_train = parse_subjects_arg(args.subjects_train)
+    subjects_test = parse_subjects_arg(args.subjects_test)
 
 def fetch(subjects, action_filter=None, subset=1, parse_3d_poses=True, load_gt=False):
     out_poses_3d = []
@@ -151,7 +214,10 @@ def fetch(subjects, action_filter=None, subset=1, parse_3d_poses=True, load_gt=F
                 poses_3d = dataset[subject][action]['positions_3d']
                 assert len(poses_3d) == len(poses_2d), 'Camera count mismatch'
                 for i in range(len(poses_3d)): # Iterate across cameras
-                    out_poses_3d.append(poses_3d[i])
+                    pose = poses_3d[i].copy()
+                    if args.dataset == 'h3wb':
+                        pose = pose / 1000.0
+                    out_poses_3d.append(pose)
 
     if len(out_camera_params) == 0:
         out_camera_params = None
@@ -287,12 +353,16 @@ if not args.evaluate:
             if torch.cuda.is_available():
                 inputs_3d = inputs_3d.cuda()
                 inputs_2d = inputs_2d.cuda()
-            inputs_3d[:, :, 0] = 0
+            inputs_3d, center = center_torch(inputs_3d, center_indices, centering_mode)
+            if center is not None:
+                center = center.detach()
 
             optimizer.zero_grad()
 
             # Predict 3D poses
             predicted_3d_pos = model_pos_train(inputs_2d)
+            if center is not None:
+                predicted_3d_pos = predicted_3d_pos - center
 
             loss_3d_pos = mpjpe(predicted_3d_pos, inputs_3d)
             epoch_loss_3d_train += inputs_3d.shape[0] * inputs_3d.shape[1] * loss_3d_pos.item()
@@ -319,6 +389,8 @@ if not args.evaluate:
 
             epoch_loss_3d_valid = 0
             N = 0
+            part_errors_eval = collections.defaultdict(float)
+            part_frame_eval = 0
             if not args.no_eval:
                 # Evaluate on test set
                 for _, batch, batch_2d in test_generator.next_epoch():
@@ -339,7 +411,9 @@ if not args.evaluate:
                         inputs_2d_flip = inputs_2d_flip.cuda()
                         inputs_3d = inputs_3d.cuda()
 
-                    inputs_3d[:, :, 0] = 0
+                    inputs_3d, center = center_torch(inputs_3d, center_indices, centering_mode)
+                    if center is not None:
+                        center = center.detach()
 
                     predicted_3d_pos = model_pos(inputs_2d)
                     predicted_3d_pos_flip = model_pos(inputs_2d_flip)
@@ -350,16 +424,31 @@ if not args.evaluate:
                     predicted_3d_pos = torch.mean(torch.cat((predicted_3d_pos, predicted_3d_pos_flip), dim=1), dim=1,
                                                   keepdim=True)
 
+                    if center is not None:
+                        predicted_3d_pos = predicted_3d_pos - center
+
                     loss_3d_pos = mpjpe(predicted_3d_pos, inputs_3d)
                     torch.cuda.empty_cache()
 
                     epoch_loss_3d_valid += inputs_3d.shape[0] * inputs_3d.shape[1] * loss_3d_pos.item()
                     N += inputs_3d.shape[0] * inputs_3d.shape[1]
 
+                    if args.dataset == 'h3wb' and hasattr(dataset, 'accumulate_part_errors') and dataset.has_partitions():
+                        pred_np = predicted_3d_pos.detach().cpu().numpy()
+                        gt_np = inputs_3d.detach().cpu().numpy()
+                        batch_errors, frame_count = dataset.accumulate_part_errors(pred_np, gt_np)
+                        for name, value in batch_errors.items():
+                            part_errors_eval[name] += value
+                        part_frame_eval += frame_count
+
                     del inputs_2d, inputs_2d_flip, inputs_3d, loss_3d_pos, predicted_3d_pos, predicted_3d_pos_flip
                     torch.cuda.empty_cache()
 
                 losses_3d_valid.append(epoch_loss_3d_valid / N)
+                if args.dataset == 'h3wb' and part_frame_eval > 0:
+                    print('H3WB part MPJPE (mm):')
+                    for name, total in part_errors_eval.items():
+                        print('  {}: {:.3f}'.format(name, total / part_frame_eval * 1000.0))
 
         elapsed = (time() - start_time) / 60
 
@@ -443,6 +532,8 @@ def evaluate(test_generator, action=None, return_predictions=False, use_trajecto
     if args.dataset.startswith('mpi'):
         epoch_loss_pck = 0
         epoch_loss_auc = 0
+    part_errors_total = collections.defaultdict(float)
+    part_frame_total = 0
     with torch.no_grad():
         if not use_trajectory_model:
             model_pos.eval()
@@ -469,7 +560,9 @@ def evaluate(test_generator, action=None, return_predictions=False, use_trajecto
                 inputs_2d_flip = inputs_2d_flip.cuda()
                 inputs_3d = inputs_3d.cuda()
                 cam = cam.cuda()
-            inputs_3d[:, :, 0] = 0
+            inputs_3d, center = center_torch(inputs_3d, center_indices, centering_mode)
+            if center is not None:
+                center = center.detach()
 
             predicted_3d_pos = model_pos(inputs_2d)
             predicted_3d_pos_flip = model_pos(inputs_2d_flip)
@@ -480,6 +573,8 @@ def evaluate(test_generator, action=None, return_predictions=False, use_trajecto
 
             predicted_3d_pos = torch.mean(torch.cat((predicted_3d_pos, predicted_3d_pos_flip), dim=1), dim=1,
                                           keepdim=True)
+            if center is not None:
+                predicted_3d_pos = predicted_3d_pos - center
 
             del inputs_2d, inputs_2d_flip
             torch.cuda.empty_cache()
@@ -493,6 +588,14 @@ def evaluate(test_generator, action=None, return_predictions=False, use_trajecto
 
             epoch_loss_3d_pos += inputs_3d.shape[0]*inputs_3d.shape[1] * error.item()
             N += inputs_3d.shape[0] * inputs_3d.shape[1]
+
+            if args.dataset == 'h3wb' and hasattr(dataset, 'accumulate_part_errors') and dataset.has_partitions():
+                pred_np = predicted_3d_pos.detach().cpu().numpy()
+                gt_np = inputs_3d.detach().cpu().numpy()
+                batch_errors, frame_count = dataset.accumulate_part_errors(pred_np, gt_np)
+                for name, value in batch_errors.items():
+                    part_errors_total[name] += value
+                part_frame_total += frame_count
 
             inputs = inputs_3d.cpu().numpy().reshape(-1, inputs_3d.shape[-2], inputs_3d.shape[-1])
             predicted_3d_pos = predicted_3d_pos.cpu().numpy().reshape(-1, inputs_3d.shape[-2], inputs_3d.shape[-1])
@@ -522,6 +625,10 @@ def evaluate(test_generator, action=None, return_predictions=False, use_trajecto
         print('Protocol #4 PCK:', e4)
         print('Protocol #5 AUC:', e5)
     print('Velocity Error (MPJVE):', ev, 'mm')
+    if args.dataset == 'h3wb' and part_frame_total > 0:
+        print('H3WB part MPJPE (mm):')
+        for name, total in part_errors_total.items():
+            print('  {}: {:.3f}'.format(name, total / part_frame_total * 1000.0))
     print('----------')
 
     if args.dataset.startswith('mpi'):
@@ -618,7 +725,10 @@ else:
             poses_3d = dataset[subject][action]['positions_3d']
             assert len(poses_3d) == len(poses_2d), 'Camera count mismatch'
             for i in range(len(poses_3d)):  # Iterate across cameras
-                out_poses_3d.append(poses_3d[i])
+                pose = poses_3d[i].copy()
+                if args.dataset == 'h3wb':
+                    pose = pose / 1000.0
+                out_poses_3d.append(pose)
 
             if subject in dataset.cameras():
                 cams = dataset.cameras()[subject]
