@@ -21,6 +21,7 @@ python -u run_3dhp_seal.py --gpu 0 \
     --em-loss-type margin --em-margin-type mpjpe \
     -c checkpoint_3dhp_seal \
     > out_3dhp_seal.log 2> error_3dhp_seal.log
-
-
+#################
+#처음에 학습할때 쓴거#
+#################
 # python run_3dhp.py -f 81 -frame-kept 9 -coeff-kept 9 -b 512 --train 1 --lr 0.0007 -lrd 0.97 -c CKPT_NAME --gpu 0

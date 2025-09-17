@@ -330,6 +330,8 @@ if not args.evaluate:
             t_idx = getattr(model_pos_train, 't_idx', inputs_2d.shape[1] // 2)
             inputs_2d_center = inputs_2d[:, t_idx:t_idx + predicted_3d_pos.shape[1]]
             loss_mp = (torch.norm(predicted_3d_pos - inputs_3d, dim=-1) * w_mpjpe.view(1, 1, -1)).mean()
+            if torch.isnan(loss_mp):
+                raise ValueError('NaN encountered in MPJPE loss; check input data for invalid values.')
             delta = predicted_3d_pos[:, 1:] - predicted_3d_pos[:, :-1]
             smooth = (delta.pow(2).mean(dim=-1) * w_mpjpe).mean()
             vel_gt = inputs_3d[:, 1:] - inputs_3d[:, :-1]
@@ -340,7 +342,7 @@ if not args.evaluate:
             energy_pred = loss_net(inputs_2d_center, predicted_3d_pos).mean()
             loss_task_total = loss_mp + loss_temp
             loss_back = loss_task_total + args.energy_weight * energy_pred
-            loss_back.backward(loss_back.clone().detach())
+            loss_back.backward()
             optimizer.step()
             for p in loss_net.parameters():
                 p.requires_grad = True
@@ -395,6 +397,8 @@ if not args.evaluate:
                                                   keepdim=True)
 
                     loss_3d_pos = mpjpe(predicted_3d_pos, inputs_3d)
+                    if torch.isnan(loss_3d_pos):
+                        raise ValueError('NaN encountered during validation; check model outputs and inputs.')
                     torch.cuda.empty_cache()
 
                     epoch_loss_3d_valid += inputs_3d.shape[0] * inputs_3d.shape[1] * loss_3d_pos.item()

@@ -8,3 +8,4 @@ checkpoint/
 *.logs
 *.npz
 *.bin
+*.sh
