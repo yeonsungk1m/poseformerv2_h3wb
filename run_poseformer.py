@@ -21,10 +21,11 @@ import logging
 
 from einops import rearrange, repeat
 from copy import deepcopy
-from typing import List, Optional
+from collections.abc import Mapping
+from typing import Dict, List, Optional
 from common.camera import *
 import collections
-
+import glob
 from common.model_poseformer import *
 
 from common.loss import *
@@ -36,11 +37,87 @@ from tqdm import tqdm
 
 args = parse_args()
 log =  logging.getLogger()
+h3wb_cameras = None
+h3wb_coerce_sequence = None
 def parse_subjects_arg(value: str) -> List[str]:
     if not value:
         return []
     return [item for item in value.split(',') if item]
 
+def _maybe_object_to_python(value):
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        try:
+            return value.item()
+        except ValueError:
+            return [_maybe_object_to_python(item) for item in value.tolist()]
+    return value
+
+
+def _prepare_keypoints_from_archive(raw_keypoints, dataset_name=None, coerce_fn=None, cameras=None):
+    data = _maybe_object_to_python(raw_keypoints)
+    if isinstance(data, Mapping):
+        converted = {}
+        for subject, actions in data.items():
+            actions = _maybe_object_to_python(actions)
+            if isinstance(actions, Mapping):
+                converted[subject] = {
+                    action: _maybe_object_to_python(value)
+                    for action, value in actions.items()
+                }
+            else:
+                converted[subject] = actions
+        data = converted
+
+    if dataset_name == 'h3wb' and isinstance(data, Mapping) and coerce_fn and cameras:
+        prepared = {}
+        for subject, actions in data.items():
+            actions = _maybe_object_to_python(actions)
+            if not isinstance(actions, Mapping):
+                raise TypeError(
+                    f'Unexpected structure for subject {subject} in H3WB keypoints archive.'
+                )
+            subject_dict = {}
+            for action, value in actions.items():
+                value = _maybe_object_to_python(value)
+                subject_dict[action] = coerce_fn(subject, cameras, value, dims=2)
+            prepared[subject] = subject_dict
+        return prepared
+
+    return data
+
+
+def _dataset_provided_keypoints(dataset, keypoints_path, notice=None):
+    if not hasattr(dataset, 'keypoints'):
+        raise FileNotFoundError(
+            f'No 2D detections found in {keypoints_path} and the dataset does not provide keypoints.'
+        )
+
+    keypoints = dataset.keypoints()
+    if not keypoints:
+        raise FileNotFoundError(
+            f'No 2D detections found in {keypoints_path} and the dataset does not provide keypoints.'
+        )
+
+    if notice:
+        print(notice)
+    print('Using 2D detections bundled with the H3WB dataset archive.')
+
+    metadata = {}
+    if hasattr(dataset, 'keypoints_metadata'):
+        metadata_candidate = dataset.keypoints_metadata()
+        if isinstance(metadata_candidate, Mapping):
+            metadata = dict(metadata_candidate)
+
+    normalized = False
+    if hasattr(dataset, 'keypoints_are_normalized'):
+        normalized = bool(dataset.keypoints_are_normalized())
+
+    if metadata:
+        normalized = normalized or bool(
+            metadata.get('normalized') or metadata.get('is_normalized')
+        )
+
+    return keypoints, metadata, normalized
 
 def resolve_center_indices(dataset, centering_mode: str) -> Optional[List[int]]:
     if hasattr(dataset, 'resolve_center'):
@@ -87,7 +164,7 @@ if args.dataset == 'h36m':
     dataset = Human36mDataset(dataset_path)
 elif args.dataset == 'h3wb':
     from common.h3wb_dataset import Human3WBDataset
-    dataset = Human3WBDataset(dataset_path)
+    dataset = Human3WBDataset(dataset_path, min_sequence_length=args.number_of_frames)
 elif args.dataset.startswith('custom'):
     from common.custom_dataset import CustomDataset
     dataset = CustomDataset('data/data_2d_' + args.dataset + '_' + args.keypoints + '.npz')
@@ -120,37 +197,97 @@ if args.dataset != 'h3wb':
 
 print('Loading 2D detections...')
 keypoints_path = f"data/data_2d_{args.dataset}_{args.keypoints}.npz"
-keypoints_metadata = None
+keypoints_metadata: Dict = {}
 keypoints_are_normalized = False
+keypoints = None
+archive_key_used = None
 
 if os.path.exists(keypoints_path):
     with np.load(keypoints_path, allow_pickle=True) as keypoints_file:
-        keypoints_metadata = keypoints_file['metadata'].item()
-        keypoints = keypoints_file['positions_2d'].item()
-else:
-    if args.dataset == 'h3wb' and hasattr(dataset, 'keypoints'):
-        keypoints = dataset.keypoints()
-        if not keypoints:
-            raise FileNotFoundError(
-                f'No 2D detections found in {keypoints_path} and dataset does not provide keypoints.'
-            )
-        print('Using 2D detections bundled with the H3WB dataset archive.')
-        metadata_from_dataset = dataset.keypoints_metadata() if hasattr(dataset, 'keypoints_metadata') else {}
-        keypoints_metadata = dict(metadata_from_dataset) if metadata_from_dataset else {}
-        if hasattr(dataset, 'keypoints_are_normalized'):
-            keypoints_are_normalized = bool(dataset.keypoints_are_normalized())
-    else:
-        raise FileNotFoundError(
-            f'2D detections file {keypoints_path} was not found and the dataset does not provide keypoints.'
-        )
+        metadata_candidate = keypoints_file['metadata'] if 'metadata' in keypoints_file else None
+        if metadata_candidate is not None:
+            metadata_candidate = _maybe_object_to_python(metadata_candidate)
+            if isinstance(metadata_candidate, Mapping):
+                keypoints_metadata = dict(metadata_candidate)
 
-if keypoints_metadata is None:
-    keypoints_metadata = {}
+        for candidate in ('positions_2d', 'poses_2d', 'pose_2d', 'pose2d'):
+            if candidate in keypoints_file:
+                archive_key_used = candidate
+                raw_keypoints = keypoints_file[candidate]
+                break
+        else:
+            raw_keypoints = None
+
+        if raw_keypoints is not None:
+            try:
+                keypoints = _prepare_keypoints_from_archive(
+                    raw_keypoints,
+                    dataset_name=args.dataset,
+                    coerce_fn=h3wb_coerce_sequence,
+                    cameras=h3wb_cameras,
+                )
+            except Exception as exc:
+                print(
+                    f"Warning: failed to parse 2D detections from {keypoints_path} using '{archive_key_used}': {exc}"
+                )
+                keypoints = None
+            else:
+                if archive_key_used and archive_key_used != 'positions_2d':
+                    print(
+                        f"Using '{archive_key_used}' entries from {keypoints_path} for 2D detections."
+                    )
+
+        if keypoints is not None and not isinstance(keypoints, Mapping):
+            if args.dataset == 'h3wb' and hasattr(dataset, 'keypoints'):
+                print(
+                    f"2D detections file {keypoints_path} has an unexpected structure; "
+                    'falling back to pose_2d sequences provided by the dataset.'
+                )
+                keypoints = None
+            else:
+                raise TypeError(
+                    f"2D detections file {keypoints_path} has an unexpected structure (expected a mapping)."
+                )
 
 keypoints_are_normalized = keypoints_are_normalized or bool(
     keypoints_metadata.get('normalized') or keypoints_metadata.get('is_normalized')
 )
-
+if not keypoints:
+    if args.dataset == 'h3wb':
+        notice = None
+        if os.path.exists(keypoints_path):
+            if archive_key_used:
+                if archive_key_used == 'positions_2d':
+                    notice = (
+                        f"2D detections file {keypoints_path} contains a 'positions_2d' entry that "
+                        'could not be parsed; using the per-camera pose_2d tracks bundled with '
+                        'the dataset instead.'
+                    )
+                else:
+                    notice = (
+                        f"Using the dataset-provided pose_2d tracks because the '{archive_key_used}' entry "
+                        f'in {keypoints_path} could not be converted into camera-aligned sequences.'
+                    )
+            else:
+                notice = (
+                    f"2D detections file {keypoints_path} does not expose a usable 'positions_2d' entry; "
+                    'using the per-camera pose_2d tracks bundled with the dataset instead.'
+                )
+        keypoints, dataset_metadata, dataset_normalized = _dataset_provided_keypoints(
+            dataset, keypoints_path, notice=notice
+        )
+        if keypoints_metadata:
+            merged_metadata = dict(keypoints_metadata)
+            merged_metadata.update(dataset_metadata)
+            keypoints_metadata = merged_metadata
+        else:
+            keypoints_metadata = dataset_metadata
+        keypoints_are_normalized = keypoints_are_normalized or dataset_normalized
+    else:
+        raise FileNotFoundError(
+            f'2D detections file {keypoints_path} was not found and the dataset does not provide keypoints.'
+        )
+        
 keypoints_symmetry = keypoints_metadata.get('keypoints_symmetry')
 if not keypoints_symmetry:
     keypoints_symmetry = (

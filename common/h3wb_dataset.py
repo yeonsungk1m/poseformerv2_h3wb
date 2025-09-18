@@ -133,6 +133,11 @@ def _merge_nested_dict(target: Dict, source: Optional[Mapping]) -> None:
                 continue
             subject_dict[sequence] = value
 
+def _to_ndarray(value) -> np.ndarray:
+    array = value
+    while isinstance(array, np.ndarray) and array.dtype == object and array.size == 1:
+        array = array.item()
+    return np.asarray(array)
 
 def _reshape_pose(array: np.ndarray, dims: int) -> np.ndarray:
     arr = np.asarray(array)
@@ -152,10 +157,100 @@ def _reshape_pose(array: np.ndarray, dims: int) -> np.ndarray:
         arr = arr[..., :dims]
     return arr.astype('float32')
 
+def _sanitize_pose_entry(value):
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        if value.ndim == 0:
+            return _sanitize_pose_entry(value.item())
+        return [_sanitize_pose_entry(item) for item in value.tolist()]
+    if isinstance(value, Mapping):
+        return {key: _sanitize_pose_entry(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_pose_entry(item) for item in value]
+    return value
 
-def _coerce_camera_sequence(subject: str, cameras: Dict[str, List[Dict]], value, dims: int) -> List[np.ndarray]:
+
+def _ingest_pose_annotations(
+    container: Optional[Mapping],
+    positions_world: Dict,
+    positions_camera: Dict,
+    positions_2d: Dict,
+) -> None:
+    if not isinstance(container, Mapping):
+        return
+
+    for subject, actions in container.items():
+        if not isinstance(actions, Mapping):
+            continue
+
+        subject_world = positions_world.get(subject)
+        if isinstance(subject_world, Mapping):
+            if not isinstance(subject_world, dict):
+                subject_world = dict(subject_world)
+        else:
+            subject_world = {}
+        positions_world[subject] = subject_world
+
+        subject_camera = positions_camera.get(subject)
+        if isinstance(subject_camera, Mapping):
+            if not isinstance(subject_camera, dict):
+                subject_camera = dict(subject_camera)
+        else:
+            subject_camera = {}
+        positions_camera[subject] = subject_camera
+
+        subject_2d = positions_2d.get(subject)
+        if isinstance(subject_2d, Mapping):
+            if not isinstance(subject_2d, dict):
+                subject_2d = dict(subject_2d)
+        else:
+            subject_2d = {}
+        positions_2d[subject] = subject_2d
+
+        for action, act_data in actions.items():
+            if not isinstance(act_data, Mapping):
+                continue
+
+            global_pose = act_data.get('global_3d')
+            if global_pose is not None and action not in subject_world:
+                subject_world[action] = _reshape_pose(_sanitize_pose_entry(global_pose), dims=3)
+
+            camera_pose = act_data.get('camera_3d')
+            if camera_pose is not None and action not in subject_camera:
+                subject_camera[action] = _sanitize_pose_entry(camera_pose)
+
+            pose_2d = act_data.get('pose_2d')
+            if pose_2d is not None and action not in subject_2d:
+                subject_2d[action] = _sanitize_pose_entry(pose_2d)
+
+
+def _prepare_position_container(container: Optional[Mapping]) -> Dict:
+    if not isinstance(container, Mapping):
+        return {}
+
+    prepared: Dict = {}
+    for subject, value in container.items():
+        if isinstance(value, Mapping) and not isinstance(value, dict):
+            prepared[subject] = dict(value)
+        else:
+            prepared[subject] = value
+    return prepared
+
+def _coerce_camera_sequence(
+    subject: str,
+    cameras: Dict[str, List[Dict]],
+    value,
+    dims: Optional[int],
+    dtype: Optional[str] = None,
+) -> List[np.ndarray]:
     if value is None:
         return []
+    def _convert(item):
+        array = _to_ndarray(item)
+        if dims is not None:
+            array = _reshape_pose(array, dims)
+        if dtype is not None:
+            array = array.astype(dtype, copy=False)
+        return array
 
     if isinstance(value, Mapping):
         ordered: List[np.ndarray] = []
@@ -173,26 +268,34 @@ def _coerce_camera_sequence(subject: str, cameras: Dict[str, List[Dict]], value,
                     used_keys.add(candidate)
                     break
             if found is not None:
-                ordered.append(_reshape_pose(found, dims))
+                ordered.append(_convert(found))
         for key, item in value.items():
             if key in used_keys:
                 continue
-            ordered.append(_reshape_pose(item, dims))
+            ordered.append(_convert(item))
         return ordered
 
     if isinstance(value, np.ndarray):
-        if value.ndim == 3:
-            sequence = [value]
-        elif value.ndim == 4:
-            sequence = [value[i] for i in range(value.shape[0])]
+        if dims is None:
+            if value.ndim == 1:
+                sequence = [value]
+            elif value.ndim == 2:
+                sequence = [value[i] for i in range(value.shape[0])]
+            else:
+                raise ValueError(f'Unexpected array shape {value.shape}.')
         else:
-            raise ValueError(f'Unexpected pose array shape {value.shape}.')
+            if value.ndim == 3:
+                sequence = [value]
+            elif value.ndim == 4:
+                sequence = [value[i] for i in range(value.shape[0])]
+            else:
+                raise ValueError(f'Unexpected pose array shape {value.shape}.')
     elif isinstance(value, (list, tuple)):
         sequence = list(value)
     else:
         sequence = [value]
 
-    return [_reshape_pose(item, dims) for item in sequence]
+    return [_convert(item) for item in sequence]
 def _parents_from_legacy_metadata(metadata: Mapping) -> Optional[List[int]]:
     """Fallback for legacy H3WB archives without explicit skeleton parents."""
 
@@ -249,7 +352,8 @@ def _parents_from_legacy_metadata(metadata: Mapping) -> Optional[List[int]]:
     
 class Human3WBDataset(MocapDataset):
     """Loader for the Human3.6M Whole-Body (H3WB) dataset."""
-    def __init__(self, path: Union[str, Sequence[str]]):
+    def __init__(self, path: Union[str, Sequence[str]], min_sequence_length: Optional[int] = None):
+        self._min_sequence_length = int(min_sequence_length) if min_sequence_length else None
         paths = _resolve_dataset_paths(path)
         records = [self._load_archive(p) for p in paths]
 
@@ -286,10 +390,15 @@ class Human3WBDataset(MocapDataset):
         positions_world = {}
         positions_camera = {}
         positions_2d = {}
+        sample_ids: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        frame_ids: Dict[str, Dict[str, np.ndarray]] = {}
         for record in records:
             _merge_nested_dict(positions_world, record['positions_world'])
             _merge_nested_dict(positions_camera, record['positions_3d'])
-            _merge_nested_dict(positions_2d, record['positions_2d'])        
+            _merge_nested_dict(positions_2d, record['positions_2d'])
+            _merge_nested_dict(sample_ids, record.get('sample_ids'))
+            _merge_nested_dict(frame_ids, record.get('frame_ids'))
+       
 
         self._data = {}
         subjects = metadata.get('subjects')
@@ -305,6 +414,8 @@ class Human3WBDataset(MocapDataset):
             subject_world = positions_world[subject] if subject in positions_world else {}
             subject_camera = positions_camera[subject] if subject in positions_camera else {}
             subject_2d = positions_2d[subject] if subject in positions_2d else {}
+            subject_samples = sample_ids[subject] if subject in sample_ids else {}
+            subject_frames = frame_ids[subject] if subject in frame_ids else {}
 
             sequence_names = set(subject_world.keys()) | set(subject_camera.keys()) | set(subject_2d.keys())
             for seq in sorted(sequence_names):
@@ -314,9 +425,20 @@ class Human3WBDataset(MocapDataset):
                 if seq in subject_world:
                     entry['positions'] = np.asarray(subject_world[seq], dtype='float32')
                 if seq in subject_camera:
-                    entry['positions_3d'] = _coerce_camera_sequence(subject, self._cameras, subject_camera[seq], dims=3)
+                    entry['positions_3d'] = _coerce_camera_sequence(
+                        subject, self._cameras, subject_camera[seq], dims=3, dtype='float32'
+                    )
                 if seq in subject_2d:
-                    entry['positions_2d'] = _coerce_camera_sequence(subject, self._cameras, subject_2d[seq], dims=2)
+                    entry['positions_2d'] = _coerce_camera_sequence(
+                        subject, self._cameras, subject_2d[seq], dims=2, dtype='float32'
+                    )
+                    entry['pose_2d'] = [pose.copy() for pose in entry['positions_2d']]
+                if seq in subject_samples:
+                    entry['sample_ids'] = _coerce_camera_sequence(
+                        subject, self._cameras, subject_samples[seq], dims=None
+                    )
+                if seq in subject_frames:
+                    entry['frame_ids'] = _to_ndarray(subject_frames[seq])
                 self._data[subject][seq] = entry
 
     # ------------------------------------------------------------------
@@ -324,26 +446,233 @@ class Human3WBDataset(MocapDataset):
     # ------------------------------------------------------------------
     def _load_archive(self, path: str) -> Dict:
         with np.load(path, allow_pickle=True) as data:
-            metadata = data['metadata'].item() if 'metadata' in data else {}
-            return {
+            metadata = _to_python_dict(data, 'metadata') or {}
+            metadata = copy.deepcopy(metadata)
+
+            record = {
                 'path': path,
                 'metadata': metadata,
-                'positions_world': _to_python_dict(data, 'positions_world', 'positions', 'pose_world'),
-                'positions_3d': _to_python_dict(
-                    data,
-                    'positions_3d',
-                    'pose_3d',
-                    'poses_3d',
-                    'pose3d',
-                ),
-                'positions_2d': _to_python_dict(
-                    data,
-                    'positions_2d',
-                    'pose_2d',
-                    'poses_2d',
-                    'pose2d',
-                ),
+                'positions_world': {},
+                'positions_3d': {},
+                'positions_2d': {},
+                'sample_ids': {},
+                'frame_ids': {},
             }
+            legacy_world = _to_python_dict(data, 'positions_world', 'positions', 'pose_world')
+            _merge_nested_dict(record['positions_world'], legacy_world)
+            legacy_3d = _to_python_dict(data, 'positions_3d', 'pose_3d', 'poses_3d', 'pose3d')
+            _merge_nested_dict(record['positions_3d'], legacy_3d)
+            legacy_2d = _to_python_dict(data, 'positions_2d', 'pose_2d', 'poses_2d', 'pose2d')
+            _merge_nested_dict(record['positions_2d'], legacy_2d)
+
+            train_data = _to_python_dict(data, 'train_data')
+            if train_data:
+                (
+                    world_train,
+                    camera_train,
+                    pose2d_train,
+                    sample_train,
+                    frames_train,
+                ) = self._parse_whole_body_container(train_data)
+                _merge_nested_dict(record['positions_world'], world_train)
+                _merge_nested_dict(record['positions_3d'], camera_train)
+                _merge_nested_dict(record['positions_2d'], pose2d_train)
+                _merge_nested_dict(record['sample_ids'], sample_train)
+                _merge_nested_dict(record['frame_ids'], frames_train)
+
+                subjects_train = set(world_train.keys()) | set(camera_train.keys()) | set(pose2d_train.keys())
+                if subjects_train:
+                    existing = metadata.get('subjects_train')
+                    if isinstance(existing, np.ndarray):
+                        combined = set(existing.tolist())
+                    elif isinstance(existing, (list, tuple, set)):
+                        combined = set(existing)
+                    else:
+                        combined = set()
+                    combined.update(subjects_train)
+                    metadata['subjects_train'] = sorted(combined)
+                if not metadata.get('split'):
+                    metadata['split'] = 'train'
+
+            test_data = _to_python_dict(data, 'test_data', 'data')
+            if test_data:
+                (
+                    world_test,
+                    camera_test,
+                    pose2d_test,
+                    sample_test,
+                    frames_test,
+                ) = self._parse_whole_body_container(test_data)
+                _merge_nested_dict(record['positions_world'], world_test)
+                _merge_nested_dict(record['positions_3d'], camera_test)
+                _merge_nested_dict(record['positions_2d'], pose2d_test)
+                _merge_nested_dict(record['sample_ids'], sample_test)
+                _merge_nested_dict(record['frame_ids'], frames_test)
+
+                subjects_test = set(world_test.keys()) | set(camera_test.keys()) | set(pose2d_test.keys())
+                if subjects_test:
+                    existing = metadata.get('subjects_test')
+                    if isinstance(existing, np.ndarray):
+                        combined = set(existing.tolist())
+                    elif isinstance(existing, (list, tuple, set)):
+                        combined = set(existing)
+                    else:
+                        combined = set()
+                    combined.update(subjects_test)
+                    metadata['subjects_test'] = sorted(combined)
+                if not train_data and not metadata.get('split'):
+                    metadata['split'] = 'test'
+
+            return record
+
+    def _parse_whole_body_container(
+        self, container: Optional[Mapping]
+    ) -> Tuple[
+        Dict[str, Dict[str, np.ndarray]],
+        Dict[str, Dict[str, Dict[str, np.ndarray]]],
+        Dict[str, Dict[str, Dict[str, np.ndarray]]],
+        Dict[str, Dict[str, Dict[str, np.ndarray]]],
+        Dict[str, Dict[str, np.ndarray]],
+    ]:
+        positions_world: Dict[str, Dict[str, np.ndarray]] = {}
+        positions_3d: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        positions_2d: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        sample_ids: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        frame_ids: Dict[str, Dict[str, np.ndarray]] = {}
+
+        if container is None:
+            return positions_world, positions_3d, positions_2d, sample_ids, frame_ids
+
+        for subject, actions in container.items():
+            actions = self._ensure_mapping(actions)
+            if not isinstance(actions, Mapping):
+                continue
+
+            subject_world: Dict[str, np.ndarray] = {}
+            subject_camera: Dict[str, Dict[str, np.ndarray]] = {}
+            subject_2d: Dict[str, Dict[str, np.ndarray]] = {}
+            subject_samples: Dict[str, Dict[str, np.ndarray]] = {}
+            subject_frames: Dict[str, np.ndarray] = {}
+
+            for action_name, action_data in actions.items():
+                action_data = self._ensure_mapping(action_data)
+                if not isinstance(action_data, Mapping):
+                    continue
+
+                (
+                    world_arr,
+                    camera_dict,
+                    pose2d_dict,
+                    sample_dict,
+                    frame_vector,
+                ) = self._parse_whole_body_sequence(action_data)
+                if world_arr is not None:
+                    subject_world[action_name] = world_arr
+                if camera_dict:
+                    subject_camera[action_name] = camera_dict
+                if pose2d_dict:
+                    subject_2d[action_name] = pose2d_dict
+                if sample_dict:
+                    subject_samples[action_name] = sample_dict
+                if frame_vector is not None:
+                    subject_frames[action_name] = frame_vector
+
+            if subject_world:
+                positions_world[subject] = subject_world
+            if subject_camera:
+                positions_3d[subject] = subject_camera
+            if subject_2d:
+                positions_2d[subject] = subject_2d
+            if subject_samples:
+                sample_ids[subject] = subject_samples
+            if subject_frames:
+                frame_ids[subject] = subject_frames
+
+        return positions_world, positions_3d, positions_2d, sample_ids, frame_ids
+
+    def _ensure_mapping(self, value):
+        while isinstance(value, np.ndarray) and value.dtype == object and value.size == 1:
+            value = value.item()
+        return value
+
+    def _parse_whole_body_sequence(
+        self, action_data: Mapping
+    ) -> Tuple[
+        Optional[np.ndarray],
+        Dict[str, np.ndarray],
+        Dict[str, np.ndarray],
+        Dict[str, np.ndarray],
+        Optional[np.ndarray],
+    ]:
+        min_length = self._min_sequence_length if self._min_sequence_length else 0
+
+        def _to_float_array(value) -> Optional[np.ndarray]:
+            if value is None:
+                return None
+            array = value
+            while isinstance(array, np.ndarray) and array.dtype == object and array.size == 1:
+                array = array.item()
+            array = np.asarray(array)
+            array = array.squeeze()
+            if array.dtype != np.float32:
+                array = array.astype('float32', copy=False)
+            return array
+
+        def _to_array(value) -> Optional[np.ndarray]:
+            if value is None:
+                return None
+            array = value
+            while isinstance(array, np.ndarray) and array.dtype == object and array.size == 1:
+                array = array.item()
+            return np.asarray(array)
+
+        world = _to_float_array(action_data.get('global_3d'))
+
+        frame_count = world.shape[0] if isinstance(world, np.ndarray) and world.ndim >= 1 else None
+
+        camera_dict: Dict[str, np.ndarray] = {}
+        pose2d_dict: Dict[str, np.ndarray] = {}
+        sample_dict: Dict[str, np.ndarray] = {}
+
+        for cam_key, cam_value in action_data.items():
+            if cam_key == 'global_3d':
+                continue
+            cam_value = self._ensure_mapping(cam_value)
+            if not isinstance(cam_value, Mapping):
+                continue
+
+            camera = _to_float_array(cam_value.get('camera_3d') or cam_value.get('positions_3d'))
+            if camera is not None:
+                camera_dict[str(cam_key)] = camera
+                if frame_count is None and camera.ndim >= 1:
+                    frame_count = camera.shape[0]
+
+            pose = _to_float_array(cam_value.get('pose_2d') or cam_value.get('positions_2d'))
+            if pose is not None:
+                pose2d_dict[str(cam_key)] = pose
+                if frame_count is None and pose.ndim >= 1:
+                    frame_count = pose.shape[0]
+
+            samples = _to_array(cam_value.get('sample_id') or cam_value.get('sample_ids'))
+            if samples is not None:
+                sample_dict[str(cam_key)] = samples
+                if frame_count is None and samples.ndim >= 1:
+                    frame_count = samples.shape[0]
+
+        if min_length and frame_count is not None and frame_count < min_length:
+            return None, {}, {}, {}, None
+
+        frame_vector = _to_array(
+            action_data.get('frame_id')
+            or action_data.get('frame_ids')
+            or action_data.get('frames')
+            or action_data.get('frame')
+        )
+        if frame_vector is not None and frame_count is not None and frame_vector.ndim >= 1:
+            if frame_vector.shape[0] > frame_count:
+                frame_vector = frame_vector[:frame_count]
+
+        return world, camera_dict, pose2d_dict, sample_dict, frame_vector
 
     def _merge_metadata(self, records: List[Dict]) -> Dict:
         base: Dict = {}
@@ -1033,8 +1362,13 @@ class Human3WBDataset(MocapDataset):
         for subject, actions in self._data.items():
             subject_dict: Dict[str, List[np.ndarray]] = {}
             for action, entry in actions.items():
+                poses = None
                 if 'positions_2d' in entry:
-                    subject_dict[action] = [pose.copy() for pose in entry['positions_2d']]
+                    poses = entry['positions_2d']
+                elif 'pose_2d' in entry:
+                    poses = entry['pose_2d']
+                if poses is not None:
+                    subject_dict[action] = [np.asarray(pose, dtype='float32').copy() for pose in poses]
             if subject_dict:
                 keypoints[subject] = subject_dict
         return keypoints
