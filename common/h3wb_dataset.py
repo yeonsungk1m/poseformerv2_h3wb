@@ -634,6 +634,16 @@ class Human3WBDataset(MocapDataset):
         pose2d_dict: Dict[str, np.ndarray] = {}
         sample_dict: Dict[str, np.ndarray] = {}
 
+        def _get_first(mapping: Mapping, *keys: str):
+            for key in keys:
+                if key is None:
+                    continue
+                if key in mapping:
+                    value = mapping[key]
+                    if value is not None:
+                        return value
+            return None
+
         for cam_key, cam_value in action_data.items():
             if cam_key == 'global_3d':
                 continue
@@ -641,19 +651,25 @@ class Human3WBDataset(MocapDataset):
             if not isinstance(cam_value, Mapping):
                 continue
 
-            camera = _to_float_array(cam_value.get('camera_3d') or cam_value.get('positions_3d'))
+            camera = _to_float_array(
+                _get_first(cam_value, 'camera_3d', 'positions_3d')
+            )
             if camera is not None:
                 camera_dict[str(cam_key)] = camera
                 if frame_count is None and camera.ndim >= 1:
                     frame_count = camera.shape[0]
 
-            pose = _to_float_array(cam_value.get('pose_2d') or cam_value.get('positions_2d'))
+            pose = _to_float_array(
+                _get_first(cam_value, 'pose_2d', 'positions_2d')
+            )
             if pose is not None:
                 pose2d_dict[str(cam_key)] = pose
                 if frame_count is None and pose.ndim >= 1:
                     frame_count = pose.shape[0]
 
-            samples = _to_array(cam_value.get('sample_id') or cam_value.get('sample_ids'))
+            samples = _to_array(
+                _get_first(cam_value, 'sample_id', 'sample_ids')
+            )
             if samples is not None:
                 sample_dict[str(cam_key)] = samples
                 if frame_count is None and samples.ndim >= 1:
@@ -663,10 +679,7 @@ class Human3WBDataset(MocapDataset):
             return None, {}, {}, {}, None
 
         frame_vector = _to_array(
-            action_data.get('frame_id')
-            or action_data.get('frame_ids')
-            or action_data.get('frames')
-            or action_data.get('frame')
+            _get_first(action_data, 'frame_id', 'frame_ids', 'frames', 'frame')
         )
         if frame_vector is not None and frame_count is not None and frame_vector.ndim >= 1:
             if frame_vector.shape[0] > frame_count:
